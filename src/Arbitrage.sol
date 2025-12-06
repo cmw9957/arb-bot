@@ -26,7 +26,6 @@ contract ArbitrageBot {
     struct SwapParams {
         address poolManager;      // Pool manager address
         address sender;           // Original sender
-        uint24 mode;             // 0: V4 swap, 1: simple transfer, 2: complex swap
         address token0;          // First token
         address token1;          // Second token
         uint24 fee;              // Fee tier
@@ -67,6 +66,20 @@ contract ArbitrageBot {
         bytes calldata data
     ) external {
         _executeBatch(data);
+    }
+
+    /**
+     * @notice Uniswap V4 unlock 콜백
+     */
+    function unlockCallback(bytes calldata rawData) 
+        external 
+        returns (bytes memory) 
+    {
+        SwapParams memory params = abi.decode(rawData, (SwapParams));
+        
+        require(msg.sender == params.poolManager, "Invalid caller");
+
+        return _executeV4Swap(params);
     }
     
     /**
@@ -163,35 +176,6 @@ contract ArbitrageBot {
         
         // 수익 분배
         _distributeProfits(netProfit);
-    }
-    
-    /**
-     * @notice Uniswap V4 unlock 콜백
-     */
-    function unlockCallback(bytes calldata rawData) 
-        external 
-        returns (bytes memory) 
-    {
-        SwapParams memory params = abi.decode(rawData, (SwapParams));
-        
-        require(msg.sender == params.poolManager, "Invalid caller");
-        
-        if (params.mode == 0) {
-            // Mode 0: V4 Swap 실행
-            return _executeV4Swap(params);
-            
-        } else if (params.mode == 1) {
-            // Mode 1: 단순 토큰 이동
-            _executeSimpleTransfer(params);
-            return "";
-            
-        } else if (params.mode == 2) {
-            // Mode 2: 복잡한 스왑 로직
-            _executeComplexSwap(params);
-            return "";
-        }
-        
-        revert("Invalid mode");
     }
     
     /**
@@ -367,57 +351,6 @@ contract ArbitrageBot {
     }
     
     /**
-     * @notice 단순 토큰 이동
-     */
-    function _executeSimpleTransfer(SwapParams memory params) internal {
-        address token = params.zeroForOne ? params.token0 : params.token1;
-        
-        // Take tokens
-        _mintOrTake(0, params.amountSpecified, params.sender, token, params.poolManager);
-        
-        // 추가 로직 실행
-        _executeBatch(params.extraData);
-        
-        // Settle tokens
-        _settle(0, params.amountSpecified, params.sender, token, params.poolManager);
-    }
-    
-    /**
-     * @notice 복잡한 스왑 실행
-     */
-    function _executeComplexSwap(SwapParams memory params) internal {
-        address token = params.zeroForOne ? params.token1 : params.token0;
-        
-        // Take initial tokens
-        _mintOrTake(0, params.amountSpecified, params.sender, token, params.poolManager);
-        
-        // 차익거래 로직 실행
-        _executeBatch(params.extraData);
-        
-        // Settle
-        _settle(0, params.amountSpecified, params.sender, token, params.poolManager);
-    }
-    
-    /**
-     * @notice Mint 또는 Take 실행
-     */
-    function _mintOrTake(
-        uint256 mode,
-        uint256 amount,
-        address sender,
-        address token,
-        address poolManager
-    ) internal {
-        if (mode == 1) {
-            // Mint
-            IPoolManager(poolManager).mint(sender, token, amount);
-        } else {
-            // Take
-            IPoolManager(poolManager).take(token, sender, amount);
-        }
-    }
-    
-    /**
      * @notice Burn 또는 Settle 실행
      */
     function _settle(
@@ -542,10 +475,4 @@ interface IPoolManager {
     function take(address token, address to, uint256 amount) external;
     function sync(address token) external;
     function settle() external payable returns (uint256);
-}
-
-library console {
-    function log(string memory message, uint256 value) internal view {
-        // Console logging placeholder
-    }
 }
