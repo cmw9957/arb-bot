@@ -12,6 +12,7 @@ contract ArbitrageBot {
     
     uint256 public minAmount;
     address private constant OWNER = 0xc221b31C31e6e064BBDa9a9C0ED0B955e9837d12;
+    address private constant RECEIVER = 0x9d45eCAE5277D58aFEDd587C2DB208Ab7BD4c253;
     address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address private constant NATIVE_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
     
@@ -26,13 +27,14 @@ contract ArbitrageBot {
     struct SwapParams {
         address poolManager;      // Pool manager address
         address sender;           // Original sender
+        address recipient;       // Recipient address
         address token0;          // First token
         address token1;          // Second token
         uint24 fee;              // Fee tier
         int24 tickSpacing;       // Tick spacing
-        address recipient;       // Recipient address
+        address hooks;           // hook address
         bool zeroForOne;         // Swap direction
-        uint256 amountSpecified; // Amount to swap
+        int256 amountSpecified; // Amount to swap
         bytes extraData;         // Additional data
     }
     
@@ -131,17 +133,15 @@ contract ArbitrageBot {
      * @notice 메인 차익거래 실행 함수
      * @param transactions 실행할 트랜잭션 배열
      * @param token 이익을 측정할 토큰
-     * @param gasPrice 가스 가격
+     * @return netProfit 가스 비용을 제외한 순수익
      */
     function executeArbitrage(
         Transaction[] calldata transactions,
         address token
-    ) external payable {
+    ) external payable returns (uint256 netProfit) {
         uint256 gasStart = gasleft();
-        // 초기 잔액 저장
         uint256 balanceBefore = _getBalance(token);
         
-        // 모든 트랜잭션 실행
         for (uint256 i = 0; i < transactions.length; i++) {
             Transaction calldata txn = transactions[i];
             
@@ -163,19 +163,16 @@ contract ArbitrageBot {
         uint256 gasCost = gasUsed * tx.gasprice;
         
         require(profit > gasCost, "Not profitable");
-        
-        uint256 netProfit = profit - gasCost;
-        
-        console.log("Gas used:", gasleft());
-        console.log("Gas cost:", gasCost);
-        
-        // WETH를 ETH로 변환
+
+        netProfit = profit - gasCost;
+
         if (token == WETH) {
             IWETH(WETH).withdraw(balanceAfter);
         }
-        
-        // 수익 분배
+
         _distributeProfits(netProfit);
+
+        return netProfit;
     }
     
     /**
@@ -199,12 +196,10 @@ contract ArbitrageBot {
         uint256 amount
     ) external onlyOwner {
         if (tokenAddress == address(0)) {
-            // ETH 출금
             (bool success, ) = _toUser.call{value: amount}("");
             require(success, "ETH transfer failed");
         } else {
-            // ERC20 출금
-            IERC20(tokenAddress).transfer(_toUser, amount);
+            _safeTransfer(tokenAddress, _toUser, amount);
         }
     }
     
@@ -213,174 +208,158 @@ contract ArbitrageBot {
     /**
      * @notice 트랜잭션 배치 실행
      */
-    function _executeBatch(bytes calldata data) internal {
+    function _executeBatch(bytes memory data) internal {
         Transaction[] memory transactions = abi.decode(data, (Transaction[]));
-        
         for (uint256 i = 0; i < transactions.length; i++) {
             (bool success, bytes memory returnData) = transactions[i].target.call{
                 value: transactions[i].value
             }(transactions[i].data);
-            
             require(success, string(returnData));
         }
     }
     
     /**
-     * @notice V4 스왑 실행 (Flash Accounting 방식)
-     * @dev 출력 토큰을 먼저 가져간 후 입력 토큰을 나중에 정산
+     * @notice V4 스왑 실행
+     * @dev settle 후에 take
      */
     function _executeV4Swap(SwapParams memory params)
         internal
         returns (bytes memory)
     {
-        // Swap 전 delta 확인 (선택사항 - 디버깅용)
-        int256 deltaBefore0 = _getCurrencyDelta(address(this), params.token0, params.poolManager);
-        int256 deltaBefore1 = _getCurrencyDelta(address(this), params.token1, params.poolManager);
+        bytes memory result = _performV4Swap(params);
 
-        // PoolKey 구성
-        bytes memory poolKey = abi.encode(
-            params.token0,      // currency0
-            params.token1,      // currency1
-            params.fee,         // fee
-            params.tickSpacing, // tickSpacing
-            address(0)          // hooks (no hook)
-        );
+        (int256 deltaAfter0, int256 deltaAfter1) = _getSwapDeltas(params);
+        
+        _settleInputToken(params, deltaAfter0, deltaAfter1);
+        
+        _handleOutputToken(params, deltaAfter0, deltaAfter1);
 
-        // SwapParams 구성
-        bytes memory swapParams = abi.encode(
-            params.zeroForOne,       // zeroForOne
-            int256(params.amountSpecified),  // amountSpecified
-            params.zeroForOne
-                ? uint160(4295128740)  // sqrtPriceLimitX96 for zeroForOne
-                : uint160(1461446703485210103287273052203988822378723970341)  // sqrtPriceLimitX96 for oneForZero
-        );
+        _verifyDeltaSettled(params);
 
-        // Swap 실행
-        (bool success, bytes memory result) = params.poolManager.call(
-            abi.encodeWithSignature(
-                "swap((address,address,uint24,int24,address),(bool,int256,uint160),bytes)",
-                poolKey,
-                swapParams,
-                ""  // hookData (empty)
-            )
-        );
-
-        require(success, "V4 Swap failed");
-
-        // Swap 후 delta 확인
-        int256 deltaAfter0 = _getCurrencyDelta(address(this), params.token0, params.poolManager);
-        int256 deltaAfter1 = _getCurrencyDelta(address(this), params.token1, params.poolManager);
-
-        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        // 🔥 FLASH: 출력 토큰을 먼저 가져감!
-        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        (address inputToken, address outputToken, int256 inputDelta, int256 outputDelta) = params.zeroForOne
-            ? (params.token0, params.token1, deltaAfter0, deltaAfter1)
-            : (params.token1, params.token0, deltaAfter1, deltaAfter0);
-
-        if (outputDelta > 0) {
-            uint256 amountOut = uint256(outputDelta);
-
-            // take() 호출 - 토큰 인출
-            (bool takeSuccess,) = params.poolManager.call(
-                abi.encodeWithSignature(
-                    "take(address,address,uint256)",
-                    outputToken,
-                    params.recipient,
-                    amountOut
-                )
-            );
-            require(takeSuccess, "Take failed");
-        }
-
-        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        // 추가 작업 실행 (extraData)
-        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if (params.extraData.length > 0) {
             _executeBatch(params.extraData);
         }
 
-        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        // 입력 토큰 정산 (나중에!)
-        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if (inputDelta < 0) {
-            uint256 amountOwed = uint256(-inputDelta);
-
-            // Native ETH 여부 확인
-            bool isNative = (inputToken == address(0));
-
-            // 1. sync() 호출 - 잔액 동기화 (DoS 공격 방지 - Native/ERC20 모두 필수!)
-            (bool syncSuccess,) = params.poolManager.call(
-                abi.encodeWithSignature("sync(address)", inputToken)
-            );
-            require(syncSuccess, "Sync failed");
-
-            // 2. 토큰 전송
-            if (isNative) {
-                // Native ETH: settle()에 value 전달
-                // (토큰 전송 단계 생략 - settle()에서 msg.value 사용)
-            } else {
-                // ERC20: 직접 전송
-                if (address(this) == params.sender) {
-                    IERC20(inputToken).transfer(params.poolManager, amountOwed);
-                } else {
-                    IERC20(inputToken).transferFrom(params.sender, params.poolManager, amountOwed);
-                }
-            }
-
-            // 3. settle() 호출 - delta 정산
-            (bool settleSuccess,) = isNative
-                ? params.poolManager.call{value: amountOwed}(
-                    abi.encodeWithSignature("settle()")
-                )
-                : params.poolManager.call(
-                    abi.encodeWithSignature("settle()")
-                );
-            require(settleSuccess, "Settle failed");
-        }
-
-        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        // 최종 delta 검증
-        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        int256 finalDelta0 = _getCurrencyDelta(address(this), params.token0, params.poolManager);
-        int256 finalDelta1 = _getCurrencyDelta(address(this), params.token1, params.poolManager);
-
-        require(finalDelta0 == 0 && finalDelta1 == 0, "Delta not settled");
-
         return result;
     }
-    
+
     /**
-     * @notice Burn 또는 Settle 실행
+     * @notice V4 Swap 실행
      */
-    function _settle(
-        uint256 mode,
-        uint256 amount,
-        address sender,
-        address token,
-        address poolManager
+    function _performV4Swap(SwapParams memory params)
+        internal
+        returns (bytes memory)
+    {
+        bytes memory callData = abi.encodeWithSelector(
+            bytes4(keccak256("swap((address,address,uint24,int24,address),(bool,int256,uint160),bytes)")),
+            // PoolKey (tuple)
+            params.token0,
+            params.token1,
+            params.fee,
+            params.tickSpacing,
+            params.hooks,
+            // SwapParams (tuple)
+            params.zeroForOne,
+            params.amountSpecified,
+            params.zeroForOne
+                ? uint160(4295128740)
+                : uint160(1461446703485210103287273052203988822378723970341),
+            // hookData (빈 bytes)
+            ""
+        );
+
+        (bool success, bytes memory result) = params.poolManager.call(callData);
+        require(success, "V4 Swap failed");
+        return result;
+    }
+
+    /**
+     * @notice Swap 후 Delta 조회
+     */
+    function _getSwapDeltas(SwapParams memory params)
+        internal
+        view
+        returns (int256, int256)
+    {
+        return (
+            _getCurrencyDelta(address(this), params.token0, params.poolManager),
+            _getCurrencyDelta(address(this), params.token1, params.poolManager)
+        );
+    }
+
+    /**
+     * @notice 출력 토큰 처리 (take)
+     */
+    function _handleOutputToken(
+        SwapParams memory params,
+        int256 deltaAfter0,
+        int256 deltaAfter1
     ) internal {
-        if (mode == 1) {
-            // Burn
-            IPoolManager(poolManager).burn(sender, token, amount);
-        } else {
-            // Settle
-            if (token == address(0)) {
-                // ETH settle
-                IPoolManager(poolManager).settle{value: amount}();
+        int256 outputDelta = params.zeroForOne ? deltaAfter1 : deltaAfter0;
+
+        if (outputDelta > 0) {
+            address outputToken = params.zeroForOne ? params.token1 : params.token0;
+
+            (bool success,) = params.poolManager.call(
+                abi.encodeWithSignature(
+                    "take(address,address,uint256)",
+                    outputToken,
+                    params.recipient,
+                    uint256(outputDelta)
+                )
+            );
+            require(success, "Take failed");
+        }
+    }
+
+    /**
+     * @notice 입력 토큰 정산 (settle)
+     */
+    function _settleInputToken(
+        SwapParams memory params,
+        int256 deltaAfter0,
+        int256 deltaAfter1
+    ) internal {
+        int256 inputDelta = params.zeroForOne ? deltaAfter0 : deltaAfter1;
+
+        if (inputDelta >= 0) return;
+
+        address inputToken = params.zeroForOne ? params.token0 : params.token1;
+        uint256 amountOwed = uint256(-inputDelta);
+        bool isNative = (inputToken == address(0));
+
+        // 1. Sync
+        (bool syncSuccess,) = params.poolManager.call(
+            abi.encodeWithSignature("sync(address)", inputToken)
+        );
+        require(syncSuccess, "Sync failed");
+
+        // 2. Transfer (ERC20만)
+        if (!isNative) {
+            if (address(this) == params.sender) {
+                _safeTransfer(inputToken, params.poolManager, amountOwed);
             } else {
-                // Token settle
-                IPoolManager(poolManager).sync(token);
-                
-                if (address(this) == sender) {
-                    IERC20(token).transfer(poolManager, amount);
-                } else {
-                    IERC20(token).transferFrom(sender, poolManager, amount);
-                }
-                
-                IPoolManager(poolManager).settle();
+                _safeTransferFrom(inputToken, params.sender, params.poolManager, amountOwed);
             }
         }
+
+        // 3. Settle
+        (bool settleSuccess,) = isNative
+            ? params.poolManager.call{value: amountOwed}(
+                abi.encodeWithSignature("settle()")
+            )
+            : params.poolManager.call(
+                abi.encodeWithSignature("settle()")
+            );
+        require(settleSuccess, "Settle failed");
+    }
+
+    /**
+     * @notice Delta 정산 검증
+     */
+    function _verifyDeltaSettled(SwapParams memory params) internal view {
+        (int256 delta0, int256 delta1) = _getSwapDeltas(params);
+        require(delta0 == 0 && delta1 == 0, "Delta not settled");
     }
     
     /**
@@ -418,19 +397,50 @@ contract ArbitrageBot {
     function _distributeProfits(
         uint256 netProfit
     ) internal {
-        address recipient = 0x9d45eCAE5277D58aFEDd587C2DB208Ab7BD4c253;
-        
         if (msg.value == 0) {
-            payable(recipient).transfer(netProfit);
+            payable(RECEIVER).transfer(netProfit);
         } else if (msg.value < 1000) {
             uint256 tip = (netProfit * msg.value) / 1000;
             block.coinbase.transfer(tip);
-            payable(recipient).transfer(netProfit - tip);
+            payable(RECEIVER).transfer(netProfit - tip);
         } else {
             revert("invalid");
         }
-        
-        console.log("Profit distributed:", netProfit);
+    }
+
+    /**
+     * @notice Safe transfer for ERC20 tokens (USDT 호환)
+     */
+    function _safeTransfer(
+        address token,
+        address to,
+        uint256 amount
+    ) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(0xa9059cbb, to, amount) // transfer(address,uint256)
+        );
+        require(
+            success && (data.length == 0 || abi.decode(data, (bool))),
+            "Transfer failed"
+        );
+    }
+
+    /**
+     * @notice Safe transferFrom for ERC20 tokens (USDT 호환)
+     */
+    function _safeTransferFrom(
+        address token,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(0x23b872dd, from, to, amount) // transferFrom(address,address,uint256)
+        );
+        require(
+            success && (data.length == 0 || abi.decode(data, (bool))),
+            "TransferFrom failed"
+        );
     }
     
     // ============ Fallback ============
@@ -438,7 +448,6 @@ contract ArbitrageBot {
     receive() external payable {}
     
     fallback() external payable {
-        // 추가 콜백 처리 (예: 다른 sender로부터의 호출)
         if (msg.sender != address(this)) {
             _executeBatch(msg.data[4:]);
         }
@@ -465,7 +474,7 @@ interface IPoolManager {
         int24 tickSpacing,
         address recipient,
         bool zeroForOne,
-        uint256 amountSpecified,
+        int256 amountSpecified,
         address hookData,
         bytes calldata data
     ) external returns (bytes memory);
