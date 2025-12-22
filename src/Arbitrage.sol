@@ -10,7 +10,6 @@ contract ArbitrageBot {
     
     // ============ State Variables ============
     
-    uint256 public minAmount;
     address private constant OWNER = 0xc221b31C31e6e064BBDa9a9C0ED0B955e9837d12;
     address private constant RECEIVER = 0x9d45eCAE5277D58aFEDd587C2DB208Ab7BD4c253;
     address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
