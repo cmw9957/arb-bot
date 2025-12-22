@@ -39,9 +39,14 @@ contract ArbitrageBot {
     }
     
     // ============ Modifiers ============
-    
+
     modifier onlyOwner() {
         require(msg.sender == OWNER, "403");
+        _;
+    }
+
+    modifier onlyOwnerOrigin() {
+        require(tx.origin == OWNER, "Unauthorized origin");
         _;
     }
     
@@ -55,7 +60,7 @@ contract ArbitrageBot {
         uint256 amount0,
         uint256 amount1,
         bytes calldata data
-    ) external {
+    ) external onlyOwnerOrigin {
         _executeBatch(data);
     }
     
@@ -66,20 +71,19 @@ contract ArbitrageBot {
         int256 amount0Delta,
         int256 amount1Delta,
         bytes calldata data
-    ) external {
+    ) external onlyOwnerOrigin {
         _executeBatch(data);
     }
 
     /**
      * @notice Uniswap V4 unlock 콜백
      */
-    function unlockCallback(bytes calldata rawData) 
-        external 
-        returns (bytes memory) 
+    function unlockCallback(bytes calldata rawData)
+        external
+        onlyOwnerOrigin
+        returns (bytes memory)
     {
         SwapParams memory params = abi.decode(rawData, (SwapParams));
-        
-        require(msg.sender == params.poolManager, "Invalid caller");
 
         return _executeV4Swap(params);
     }
@@ -93,7 +97,7 @@ contract ArbitrageBot {
         uint256 amount,
         uint256 fee,
         bytes calldata data
-    ) external returns (bytes32) {
+    ) external onlyOwnerOrigin returns (bytes32) {
         _executeBatch(data);
         return keccak256("ERC3156FlashBorrower.onFlashLoan");
     }
@@ -106,7 +110,7 @@ contract ArbitrageBot {
         uint256[] calldata amounts,
         uint256[] calldata feeAmounts,
         bytes calldata userData
-    ) external {
+    ) external onlyOwnerOrigin {
         _executeBatch(userData);
     }
     
@@ -138,7 +142,7 @@ contract ArbitrageBot {
     function executeArbitrage(
         Transaction[] calldata transactions,
         address token
-    ) external payable returns (uint256 netProfit) {
+    ) external payable onlyOwner returns (uint256 netProfit) {
         uint256 gasStart = gasleft();
         uint256 balanceBefore = _getBalance(token);
         
@@ -446,12 +450,6 @@ contract ArbitrageBot {
     // ============ Fallback ============
     
     receive() external payable {}
-    
-    fallback() external payable {
-        if (msg.sender != address(this)) {
-            _executeBatch(msg.data[4:]);
-        }
-    }
 }
 
 // ============ Interfaces ============
