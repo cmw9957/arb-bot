@@ -136,7 +136,7 @@ contract ArbitrageBot {
      * @notice 메인 차익거래 실행 함수
      * @param transactions 실행할 트랜잭션 배열
      * @param token 이익을 측정할 토큰
-     * @return netProfit 가스 비용을 제외한 순수익
+     * @return netProfit 팁을 제외한 순수익 (RECEIVER에게 전송되는 금액)
      */
     function executeArbitrage(
         Transaction[] calldata transactions,
@@ -144,36 +144,44 @@ contract ArbitrageBot {
     ) external payable onlyOwner returns (uint256 netProfit) {
         uint256 gasStart = gasleft();
         uint256 balanceBefore = _getBalance(token);
-        
+
         for (uint256 i = 0; i < transactions.length; i++) {
             Transaction calldata txn = transactions[i];
-            
+
             (bool success, bytes memory returnData) = txn.target.call{
                 value: txn.value
             }(txn.data);
-            
+
             require(success, string(returnData));
         }
-        
+
         // 최종 잔액 및 이익 계산
         uint256 balanceAfter = _getBalance(token);
-        uint256 profit = balanceAfter > balanceBefore 
-            ? balanceAfter - balanceBefore 
+        uint256 profit = balanceAfter > balanceBefore
+            ? balanceAfter - balanceBefore
             : 0;
-        
-        // 올바른 가스 비용 계산
-        uint256 gasUsed = gasStart - gasleft();
-        uint256 gasCost = gasUsed * tx.gasprice;
-        
-        require(profit > gasCost, "Not profitable");
 
-        netProfit = profit - gasCost;
-
-        if (token == WETH) {
-            IWETH(WETH).withdraw(balanceAfter);
+        // 팁 계산 (msg.value가 있을 경우)
+        uint256 tip = 0;
+        if (msg.value > 0 && msg.value < 1000) {
+            tip = (profit * msg.value) / 1000;
         }
 
-        _distributeProfits(netProfit);
+        // 순수익 계산
+        netProfit = profit - tip;
+
+        if (token == WETH) {
+            IWETH(WETH).withdraw(profit);
+        }
+
+        // 팁과 순수익 분배
+        if (tip > 0) {
+            block.coinbase.transfer(tip);
+        }
+
+        payable(RECEIVER).transfer(netProfit);
+
+        require(netProfit > ((gasStart - gasleft()) * tx.gasprice), "Not profitable");
 
         return netProfit;
     }
@@ -394,23 +402,6 @@ contract ArbitrageBot {
         return abi.decode(result, (int256));
     }
     
-    /**
-     * @notice 수익 분배
-     */
-    function _distributeProfits(
-        uint256 netProfit
-    ) internal {
-        if (msg.value == 0) {
-            payable(RECEIVER).transfer(netProfit);
-        } else if (msg.value < 1000) {
-            uint256 tip = (netProfit * msg.value) / 1000;
-            block.coinbase.transfer(tip);
-            payable(RECEIVER).transfer(address(this).balance);
-        } else {
-            revert("invalid");
-        }
-    }
-
     /**
      * @notice Safe transfer for ERC20 tokens (USDT 호환)
      */
