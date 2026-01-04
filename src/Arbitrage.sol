@@ -405,7 +405,7 @@ contract ArbitrageBot {
         } else if (msg.value < 1000) {
             uint256 tip = (netProfit * msg.value) / 1000;
             block.coinbase.transfer(tip);
-            payable(RECEIVER).transfer(netProfit - tip);
+            payable(RECEIVER).transfer(address(this).balance);
         } else {
             revert("invalid");
         }
